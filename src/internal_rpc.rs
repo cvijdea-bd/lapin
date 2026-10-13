@@ -1,5 +1,5 @@
 use crate::{
-    Channel, Connection, Error, ErrorKind, Promise, PromiseResolver, Result,
+    Channel, Connection, ConnectionState, Error, ErrorKind, Promise, PromiseResolver, Result,
     channels::Channels,
     connection_closer::ConnectionCloser,
     consumer_status::ConsumerStatus,
@@ -48,7 +48,7 @@ impl InternalRPCHandle {
             channel_id,
             delivery_tag,
             options,
-            DeliveryResolver::new(channel_id, resolver),
+            CommandResolver::channel(channel_id, resolver),
             error,
         ));
     }
@@ -65,7 +65,7 @@ impl InternalRPCHandle {
             channel_id,
             delivery_tag,
             options,
-            DeliveryResolver::new(channel_id, resolver),
+            CommandResolver::channel(channel_id, resolver),
             error,
         ));
     }
@@ -82,7 +82,7 @@ impl InternalRPCHandle {
             channel_id,
             delivery_tag,
             options,
-            DeliveryResolver::new(channel_id, resolver),
+            CommandResolver::channel(channel_id, resolver),
             error,
         ));
     }
@@ -138,7 +138,7 @@ impl InternalRPCHandle {
             reply_text,
             class_id,
             method_id,
-            Some(resolver),
+            Some(CommandResolver::connection(resolver)),
         ));
         promise.await
     }
@@ -148,7 +148,10 @@ impl InternalRPCHandle {
         connection_closer: Arc<ConnectionCloser>,
     ) -> Result<Channel> {
         let (promise, resolver) = Promise::new("channel.create");
-        self.send(InternalCommand::CreateChannel(connection_closer, resolver));
+        self.send(InternalCommand::CreateChannel(
+            connection_closer,
+            CommandResolver::connection(resolver),
+        ));
         promise.await
     }
 
@@ -173,6 +176,8 @@ impl InternalRPCHandle {
         connection_resolver: Option<PromiseResolver<Connection>>,
     ) {
         self.set_connection_closing();
+        let connection_resolver =
+            connection_resolver.map(|resolver| CommandResolver::new(resolver, error.clone()));
         self.send(InternalCommand::InitConnectionShutdown(
             error,
             connection_resolver,
@@ -232,7 +237,11 @@ impl InternalRPCHandle {
         reason: ShortString,
     ) -> Result<()> {
         let (promise, resolver) = Promise::new("connection.update-secret");
-        self.send(InternalCommand::UpdateSecret(secret, reason, resolver));
+        self.send(InternalCommand::UpdateSecret(
+            secret,
+            reason,
+            CommandResolver::connection(resolver),
+        ));
         promise.await
     }
 
@@ -265,21 +274,21 @@ enum InternalCommand {
         ChannelId,
         DeliveryTag,
         BasicAckOptions,
-        DeliveryResolver,
+        CommandResolver<()>,
         Option<ErrorHolder>,
     ),
     BasicNack(
         ChannelId,
         DeliveryTag,
         BasicNackOptions,
-        DeliveryResolver,
+        CommandResolver<()>,
         Option<ErrorHolder>,
     ),
     BasicReject(
         ChannelId,
         DeliveryTag,
         BasicRejectOptions,
-        DeliveryResolver,
+        CommandResolver<()>,
         Option<ErrorHolder>,
     ),
     CancelConsumer(ChannelId, ShortString, ConsumerStatus),
@@ -289,13 +298,13 @@ enum InternalCommand {
         ShortString,
         Identifier,
         Identifier,
-        Option<PromiseResolver<()>>,
+        Option<CommandResolver<()>>,
     ),
-    CreateChannel(Arc<ConnectionCloser>, PromiseResolver<Channel>),
+    CreateChannel(Arc<ConnectionCloser>, CommandResolver<Channel>),
     DeregisterConsumer(ChannelId, ShortString),
     FinishConnectionShutdown,
     InitConnectionRecovery(Error),
-    InitConnectionShutdown(Error, Option<PromiseResolver<Connection>>),
+    InitConnectionShutdown(Error, Option<CommandResolver<Connection>>),
     RemoveChannel(ChannelId, Error),
     SendConnectionCloseOk(Error),
     SendHeartbeat,
@@ -306,37 +315,57 @@ enum InternalCommand {
     Spawn(InternalFuture),
     StartChannelsRecovery,
     StartHeartbeat(Duration),
-    UpdateSecret(LongString, ShortString, PromiseResolver<()>),
+    UpdateSecret(LongString, ShortString, CommandResolver<()>),
 }
 
-/// The resolver of an ack, nack or reject command. Dropping it before its command runs rejects
-/// the promise, so a command that never runs still completes the caller's promise. That
+/// The resolver of a command's promise. Dropping it before the command runs rejects the promise
+/// with its error, so a command that never runs still completes its caller's promise. That
 /// happens when the command's channel is gone, or when the IO loop has already exited.
-#[derive(Debug)]
-struct DeliveryResolver {
-    channel_id: ChannelId,
-    resolver: Option<PromiseResolver<()>>,
+struct CommandResolver<T> {
+    resolver: Option<PromiseResolver<T>>,
+    error: Error,
 }
 
-impl DeliveryResolver {
-    fn new(channel_id: ChannelId, resolver: PromiseResolver<()>) -> Self {
+impl<T> CommandResolver<T> {
+    fn new(resolver: PromiseResolver<T>, error: Error) -> Self {
         Self {
-            channel_id,
             resolver: Some(resolver),
+            error,
         }
     }
 
-    fn into_inner(mut self) -> PromiseResolver<()> {
+    /// A resolver for a command on a channel, rejected as for a channel that is gone.
+    fn channel(channel_id: ChannelId, resolver: PromiseResolver<T>) -> Self {
+        Self::new(resolver, ErrorKind::InvalidChannel(channel_id).into())
+    }
+
+    /// A resolver for a command on the connection, rejected as for a closed connection.
+    fn connection(resolver: PromiseResolver<T>) -> Self {
+        Self::new(
+            resolver,
+            ErrorKind::InvalidConnectionState(ConnectionState::Closed).into(),
+        )
+    }
+
+    fn into_inner(mut self) -> PromiseResolver<T> {
         self.resolver
             .take()
             .expect("the resolver is only taken by into_inner")
     }
 }
 
-impl Drop for DeliveryResolver {
+impl<T> fmt::Debug for CommandResolver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommandResolver")
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl<T> Drop for CommandResolver<T> {
     fn drop(&mut self) {
         if let Some(resolver) = self.resolver.take() {
-            resolver.reject(ErrorKind::InvalidChannel(self.channel_id).into());
+            resolver.reject(self.error.clone());
         }
     }
 }
@@ -491,7 +520,7 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                             .await
                     };
                     if let Some(resolver) = resolver {
-                        self.register_internal_future_with_resolver(fut, resolver)
+                        self.register_internal_future_with_resolver(fut, resolver.into_inner())
                     } else {
                         self.register_internal_future(fut)
                     }
@@ -499,9 +528,9 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                 CreateChannel(closer, resolver) => match channels.create(closer) {
                     Ok(channel) => self.register_internal_future_with_resolver(
                         async move { channel.clone().channel_open(channel).await },
-                        resolver,
+                        resolver.into_inner(),
                     ),
-                    Err(err) => resolver.reject(err),
+                    Err(err) => resolver.into_inner().reject(err),
                 },
                 DeregisterConsumer(channel_id, consumer_tag) => {
                     if let Ok(channel) = get_channel(channel_id) {
@@ -514,9 +543,11 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                     self.secret_update.reset();
                     channels.init_connection_recovery(error);
                 }
-                InitConnectionShutdown(error, connection_resolver) => {
-                    channels.init_connection_shutdown(error, connection_resolver)
-                }
+                InitConnectionShutdown(error, connection_resolver) => channels
+                    .init_connection_shutdown(
+                        error,
+                        connection_resolver.map(CommandResolver::into_inner),
+                    ),
                 RemoveChannel(channel_id, error) => {
                     if !self.channel_ok(channel_id) {
                         continue;
@@ -581,7 +612,7 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                                 .connection_update_secret(secret, reason)
                                 .await
                         },
-                        resolver,
+                        resolver.into_inner(),
                     )
                 }
             }
@@ -597,8 +628,8 @@ mod tests {
 
     #[test]
     fn a_delivery_command_dropped_unrun_rejects_its_promise() {
-        let (promise, resolver) = Promise::new("basic.ack");
-        drop(DeliveryResolver::new(1, resolver));
+        let (promise, resolver) = Promise::<()>::new("basic.ack");
+        drop(CommandResolver::channel(1, resolver));
         let error = promise.try_wait().expect("promise completed").unwrap_err();
         assert!(matches!(error.kind(), ErrorKind::InvalidChannel(1)));
     }
@@ -606,7 +637,7 @@ mod tests {
     #[test]
     fn a_delivery_command_handed_on_leaves_its_promise_to_the_command() {
         let (promise, resolver) = Promise::new("basic.ack");
-        let resolver = DeliveryResolver::new(1, resolver).into_inner();
+        let resolver = CommandResolver::channel(1, resolver).into_inner();
         assert!(promise.try_wait().is_none());
         resolver.resolve(());
         assert!(matches!(promise.try_wait(), Some(Ok(()))));

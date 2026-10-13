@@ -513,7 +513,6 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                     self.channels_status.insert(channel_id, killswitch);
                 }
                 SetConnectionClosing => {
-                    self.heartbeat.cancel();
                     self.secret_update.cancel();
                     channels.set_connection_closing();
                 }

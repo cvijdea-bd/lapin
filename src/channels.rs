@@ -178,6 +178,7 @@ impl Channels {
         for channel in self.read().channels.values() {
             channel.set_connection_error(error.clone());
         }
+        self.channel0.abandon_recovery(error);
     }
 
     pub(crate) fn flow(&self) -> bool {
@@ -240,6 +241,10 @@ impl Channels {
     }
 
     pub(crate) fn init_connection_recovery(&self, error: Error) -> Error {
+        // A recovery requested before the connection failed for good must not revive it.
+        if self.connection_status.errored() {
+            return error;
+        }
         trace!("init connection recovery");
         self.connection_status.set_reconnecting();
         self.frames.clear_connection_steps(&error);
@@ -252,6 +257,9 @@ impl Channels {
     }
 
     pub(crate) async fn start_recovery(&self) -> Result<()> {
+        if self.connection_status.errored() {
+            return Err(ErrorKind::InvalidConnectionState(ConnectionState::Error).into());
+        }
         let channels = self.read().channels.values().cloned().collect::<Vec<_>>();
 
         self.connection_killswitch.reset();

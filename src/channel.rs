@@ -156,7 +156,10 @@ impl Channel {
             && let Some(notifier) = error.notifier()
         {
             notifier.await;
-            return Ok(());
+            // An abandoned recovery wakes its waiters too, and leaves the channel down.
+            if self.status.connected() {
+                return Ok(());
+            }
         }
         Err(error)
     }
@@ -184,8 +187,14 @@ impl Channel {
         self.set_state(ChannelState::Error);
         self.error_publisher_confirms(error.clone());
         self.basic_get_delivery.reject(error.clone());
-        self.error_consumers(error.clone());
+        // The connection will not come back, so no consumer can resume.
+        self.consumers.error(error.clone(), false);
+        self.abandon_recovery(error.clone());
         self.internal_rpc.remove_channel(self.id, error.clone());
+    }
+
+    pub(crate) fn abandon_recovery(&self, error: Error) {
+        self.status.abandon_recovery(error);
     }
 
     fn error_publisher_confirms(&self, error: Error) {

@@ -54,13 +54,15 @@ impl<RK: RuntimeKit + Clone + Send + 'static> Heartbeat<RK> {
             return None;
         }
 
-        if !self.connection_status.connected() {
+        // A closing connection is still watched: its close may never be answered.
+        let closing = self.connection_status.closing();
+        if !closing && !self.connection_status.connected() {
             self.cancel();
             return None;
         }
 
         self.lock_inner()
-            .poll_timeout(internal_rpc, &self.killswitch)
+            .poll_timeout(internal_rpc, &self.killswitch, closing)
     }
 
     pub(crate) fn update_last_write(&self) {
@@ -114,6 +116,7 @@ impl Inner {
         &mut self,
         internal_rpc: &InternalRPCHandle,
         killswitch: &KillSwitch,
+        closing: bool,
     ) -> Option<Duration> {
         let timeout = self.timeout?;
 
@@ -125,7 +128,13 @@ impl Inner {
             );
             self.timeout = None;
             killswitch.kill();
-            internal_rpc.set_connection_error(ErrorKind::MissingHeartbeatError.into());
+            let error = ErrorKind::MissingHeartbeatError.into();
+            if closing {
+                // The server is gone while we were closing: the close ends here, unanswered.
+                internal_rpc.set_connection_closed(error);
+            } else {
+                internal_rpc.set_connection_error(error);
+            }
             return None;
         }
 

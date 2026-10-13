@@ -518,7 +518,8 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                     channels.set_connection_closing();
                 }
                 SetConnectionClosed(error) => {
-                    self.frames.clear_all_expected_replies(error.clone());
+                    // Frames still queued will never be written: fail them along with the replies.
+                    self.frames.drop_pending(error.clone(), &self.handle);
                     channels.set_connection_closed(error);
                 }
                 SetConnectionError(error) => {

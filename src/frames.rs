@@ -166,10 +166,6 @@ impl Frames {
         }
     }
 
-    pub(crate) fn clear_all_expected_replies(&self, error: Error) {
-        self.lock_inner().clear_all_expected_replies(error)
-    }
-
     pub(crate) fn cancel_expected_replies(replies: VecDeque<ExpectedReply>, error: Error) {
         Inner::cancel_expected_replies(replies, error)
     }

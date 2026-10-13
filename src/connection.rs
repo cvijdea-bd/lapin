@@ -457,6 +457,56 @@ mod tests {
         ));
     }
 
+    /// Awaits a call whose command is never run, as `create_connection`'s IO loop is gone.
+    async fn completes<T>(call: impl Future<Output = Result<T>>) -> Result<T> {
+        tokio::time::timeout(std::time::Duration::from_secs(1), call)
+            .await
+            .expect("the call never completed")
+    }
+
+    fn closed(error: Error) -> bool {
+        matches!(
+            error.kind(),
+            ErrorKind::InvalidConnectionState(ConnectionState::Closed)
+        )
+    }
+
+    #[tokio::test]
+    async fn a_create_channel_whose_command_never_runs_completes() {
+        let (conn, _channels, _internal_rpc) = create_connection();
+        assert!(closed(completes(conn.create_channel()).await.unwrap_err()));
+    }
+
+    #[tokio::test]
+    async fn a_close_whose_command_never_runs_completes() {
+        let (conn, _channels, _internal_rpc) = create_connection();
+        assert!(closed(
+            completes(conn.close(200, "bye".into())).await.unwrap_err()
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_update_secret_whose_command_never_runs_completes() {
+        let (conn, _channels, _internal_rpc) = create_connection();
+        let update = conn.update_secret("secret".into(), "rotation".into());
+        assert!(closed(completes(update).await.unwrap_err()));
+    }
+
+    #[test]
+    fn a_connection_shutdown_whose_command_never_runs_rejects_the_connection() {
+        let (_conn, _channels, internal_rpc) = create_connection();
+        let (promise, resolver) = Promise::<Connection>::new("connection");
+        let error: Error = ErrorKind::MissingHeartbeatError.into();
+        internal_rpc.init_connection_shutdown(error, Some(resolver));
+        let error = promise
+            .try_wait()
+            .expect("the connection promise stayed pending");
+        assert!(matches!(
+            error.unwrap_err().kind(),
+            ErrorKind::MissingHeartbeatError
+        ));
+    }
+
     #[test]
     fn clear_connection_steps_rejects_all_handshake_stages() {
         let frames = Frames::default();

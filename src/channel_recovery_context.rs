@@ -50,4 +50,38 @@ impl ChannelRecoveryContext {
             Frames::cancel_expected_replies(replies, self.cause);
         }
     }
+
+    /// Ends a recovery that will not complete: wakes its waiters and fails the replies it kept.
+    pub(crate) fn abandon(self, error: Error) {
+        self.notifier.notify_all();
+        if let Some(replies) = self.expected_replies {
+            Frames::cancel_expected_replies(replies, error);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ConnectionState, ErrorKind, Promise, channel::Reply};
+    use futures_lite::future;
+
+    #[test]
+    fn an_abandoned_recovery_wakes_its_waiters_and_fails_the_replies_it_kept() {
+        let mut ctx = ChannelRecoveryContext::new(
+            ErrorKind::MissingHeartbeatError.into(),
+            ChannelDefinition::default(),
+        );
+        let (reply, resolver) = Promise::<()>::new("tx.select-ok");
+        ctx.set_expected_replies(Some(VecDeque::from([ExpectedReply(
+            Reply::TxSelectOk(resolver.clone()),
+            Box::new(resolver),
+        )])));
+        let notifier = ctx.notifier();
+
+        ctx.abandon(ErrorKind::InvalidConnectionState(ConnectionState::Error).into());
+
+        assert!(future::block_on(future::poll_once(notifier)).is_some());
+        assert!(matches!(reply.try_wait(), Some(Err(_))));
+    }
 }

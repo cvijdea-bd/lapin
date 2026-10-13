@@ -66,6 +66,14 @@ impl ChannelStatus {
         self.write().finalize_connection();
     }
 
+    /// Ends the recovery in progress, if any, because it will not complete.
+    pub(crate) fn abandon_recovery(&self, error: Error) {
+        let recovery_context = self.write().recovery_context.take();
+        if let Some(ctx) = recovery_context {
+            ctx.abandon(error);
+        }
+    }
+
     pub(crate) fn can_receive_messages(&self) -> bool {
         [
             ChannelState::Closing,

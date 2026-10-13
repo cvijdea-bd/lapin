@@ -113,7 +113,6 @@ impl Inner {
     fn complete_pending(
         &mut self,
         success: bool,
-        delivery_tag: DeliveryTag,
         resolvers: (PromiseResolver<Confirmation>, PromiseResolver<()>),
     ) {
         let returned_message = self.returned_messages.get_waiting_message();
@@ -122,20 +121,19 @@ impl Inner {
         } else {
             Confirmation::Nack(returned_message)
         });
-        if Some(delivery_tag) == self.delivery_tag.current() {
-            resolvers.1.resolve(());
-        }
+        // A wait_for_confirms may hold this tag's wait promise even after later publishes.
+        resolvers.1.resolve(());
     }
 
     fn drop_all(&mut self, success: bool) {
-        for (delivery_tag, resolvers) in std::mem::take(&mut self.pending) {
-            self.complete_pending(success, delivery_tag, resolvers);
+        for resolvers in std::mem::take(&mut self.pending).into_values() {
+            self.complete_pending(success, resolvers);
         }
     }
 
     fn drop_pending(&mut self, delivery_tag: DeliveryTag, success: bool) -> AMQPResult {
         if let Some(resolvers) = self.pending.remove(&delivery_tag) {
-            self.complete_pending(success, delivery_tag, resolvers);
+            self.complete_pending(success, resolvers);
             Ok(())
         } else {
             Err(AMQPError::new(
@@ -174,11 +172,9 @@ impl Inner {
     }
 
     fn on_channel_error(&mut self, error: Error) {
-        for (delivery_tag, resolvers) in self.pending.drain() {
+        for (_, resolvers) in self.pending.drain() {
             resolvers.0.reject(error.clone());
-            if Some(delivery_tag) == self.delivery_tag.current() {
-                resolvers.1.reject(error.clone());
-            }
+            resolvers.1.reject(error.clone());
         }
         self.returned_messages.clear_dropped_confirms();
     }
@@ -186,5 +182,37 @@ impl Inner {
     fn reset(&mut self, error: Error) {
         self.delivery_tag = IdSequence::new(false);
         self.on_channel_error(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ErrorKind;
+
+    /// `wait_for_confirms` takes the newest tag's wait promise; a publish made afterwards must not
+    /// leave that promise uncompleted once its own tag is confirmed.
+    #[test]
+    fn a_waiter_completes_when_a_later_publish_is_still_pending() {
+        let acks = Acknowledgements::new(1, ReturnedMessages::default());
+        let _first = acks.register_pending();
+        let waiter = acks.get_last_pending().expect("a pending confirm");
+        let _second = acks.register_pending();
+
+        acks.ack(1).unwrap();
+
+        assert!(matches!(waiter.try_wait(), Some(Ok(()))));
+    }
+
+    #[test]
+    fn a_waiter_fails_with_its_channel_when_a_later_publish_is_still_pending() {
+        let acks = Acknowledgements::new(1, ReturnedMessages::default());
+        let _first = acks.register_pending();
+        let waiter = acks.get_last_pending().expect("a pending confirm");
+        let _second = acks.register_pending();
+
+        acks.on_channel_error(ErrorKind::InvalidChannel(1).into());
+
+        assert!(matches!(waiter.try_wait(), Some(Err(_))));
     }
 }

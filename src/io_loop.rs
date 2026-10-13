@@ -212,15 +212,27 @@ impl<
                 let mut readable_context = Context::from_waker(&readable_waker);
                 let writable_waker = self.socket_state.writable_waker();
                 let mut writable_context = Context::from_waker(&writable_waker);
-                let (mut stream, res) = loop {
+                let (stream, res) = loop {
                     let connect = || (self.connect)(self.uri.clone(), self.runtime.clone());
                     let runtime = self.runtime.clone();
                     let connect = connect.retry(self.backoff).sleep(move |dur| runtime.sleep(dur));
-                    let mut stream = self.runtime.block_on(connect).inspect_err(|err| {
-                        trace!("Poison connection attempt");
-                        self.connection_status.poison(err.clone());
-                        self.frames.clear_connection_steps(err);
-                    })?;
+                    let mut stream = match self.runtime.block_on(connect) {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            trace!("Poison connection attempt");
+                            self.connection_status.poison(err.clone());
+                            self.frames.clear_connection_steps(&err);
+                            if self.first_connection {
+                                // A first connection has no channels yet. Fail what waits on it
+                                // without logging an error: connect returns this error itself.
+                                self.connection_status.set_state(ConnectionState::Error);
+                                self.frames.drop_pending(err.clone(), &self.internal_rpc);
+                            } else {
+                                self.channels.set_connection_error(err.clone());
+                            }
+                            break (None, Err(err));
+                        }
+                    };
                     self.half_closed = false;
                     let mut res = Ok(());
 
@@ -249,7 +261,7 @@ impl<
                             // do not carry that exchange onto a fresh TCP connection.
                             self.channels.set_connection_error(error.clone());
                             self.clear_serialized_frames(error.clone());
-                            break (stream, Err(error));
+                            break (Some(stream), Err(error));
                         }
                     }
                     self.clear_serialized_frames(self.frames.poison().or_else(|| res.clone().err()).unwrap_or(
@@ -257,7 +269,7 @@ impl<
                     ));
 
                     if !connecting && !reconnect {
-                        break (stream, res);
+                        break (Some(stream), res);
                     }
 
                     let throttle = match self.global_backoff.next() {
@@ -268,7 +280,7 @@ impl<
                                 io::Error::from(io::ErrorKind::ConnectionAborted).into()
                             });
                             self.channels.set_connection_error(error.clone());
-                            break (stream, Err(error));
+                            break (Some(stream), Err(error));
                         }
                     };
                     debug!("Throttling {:?} before reconnection to avoid flooding", throttle);
@@ -283,6 +295,7 @@ impl<
                 trace!(status=?self.status, connection_status=?self.connection_status.state(), "io_loop entering exit/cleanup phase");
                 self.internal_rpc.stop();
                 if self.heartbeat.killswitch().killed()
+                    && let Some(mut stream) = stream
                     && let Err(err) = self.runtime.block_on(std::future::poll_fn(move |cx| {
                         Pin::new(&mut stream)
                             .poll_close(cx)

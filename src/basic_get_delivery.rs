@@ -1,4 +1,6 @@
-use crate::{BasicProperties, PromiseResolver, message::BasicGetMessage, types::PayloadSize};
+use crate::{
+    BasicProperties, Error, PromiseResolver, message::BasicGetMessage, types::PayloadSize,
+};
 use std::{
     fmt,
     sync::{Arc, Mutex, MutexGuard},
@@ -27,6 +29,11 @@ impl BasicGetDelivery {
 
     pub(crate) fn handle_body_frame(&self, remaining_size: PayloadSize, payload: Vec<u8>) {
         self.lock_inner().handle_body_frame(remaining_size, payload);
+    }
+
+    /// Fails the `basic_get` still waiting for the rest of its message.
+    pub(crate) fn reject(&self, error: Error) {
+        self.lock_inner().reject(error);
     }
 
     fn lock_inner(&self) -> MutexGuard<'_, Inner> {
@@ -73,6 +80,12 @@ impl Inner {
     fn new_delivery_complete(&mut self) {
         if let Some(inner) = self.0.take() {
             inner.resolver.resolve(Some(inner.message));
+        }
+    }
+
+    fn reject(&mut self, error: Error) {
+        if let Some(inner) = self.0.take() {
+            inner.resolver.reject(error);
         }
     }
 }

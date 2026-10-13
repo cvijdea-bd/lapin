@@ -156,7 +156,10 @@ impl Channel {
             && let Some(notifier) = error.notifier()
         {
             notifier.await;
-            return Ok(());
+            // An abandoned recovery wakes its waiters too, and leaves the channel down.
+            if self.status.connected() {
+                return Ok(());
+            }
         }
         Err(error)
     }
@@ -174,6 +177,7 @@ impl Channel {
     pub(crate) fn set_closed(&self, error: Error) {
         self.set_state(ChannelState::Closed);
         self.error_publisher_confirms(error.clone());
+        self.basic_get_delivery.reject(error.clone());
         self.cancel_consumers();
         self.internal_rpc.remove_channel(self.id, error);
     }
@@ -182,8 +186,15 @@ impl Channel {
     pub(crate) fn set_connection_error(&self, error: Error) {
         self.set_state(ChannelState::Error);
         self.error_publisher_confirms(error.clone());
-        self.error_consumers(error.clone());
+        self.basic_get_delivery.reject(error.clone());
+        // The connection will not come back, so no consumer can resume.
+        self.consumers.error(error.clone(), false);
+        self.abandon_recovery(error.clone());
         self.internal_rpc.remove_channel(self.id, error.clone());
+    }
+
+    pub(crate) fn abandon_recovery(&self, error: Error) {
+        self.status.abandon_recovery(error);
     }
 
     fn error_publisher_confirms(&self, error: Error) {
@@ -352,6 +363,8 @@ impl Channel {
 
     pub(crate) fn init_recovery(&self, error: Error) -> Error {
         let err = self.status.set_reconnecting(error, self.topology());
+        // The rest of a message being received will not come on the new connection.
+        self.basic_get_delivery.reject(err.clone());
         self.frames.drop_frames_for_channel(self.id, err.clone());
         self.poison(err.clone());
         err

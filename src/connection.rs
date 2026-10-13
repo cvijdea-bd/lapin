@@ -388,10 +388,11 @@ impl Connect for &str {
 mod tests {
     use super::*;
     use crate::{
-        BasicProperties, ChannelQos, ChannelState, ConnectionProperties, ConnectionState,
+        Acker, BasicProperties, ChannelQos, ChannelState, ConnectionProperties, ConnectionState,
         ErrorKind,
         channel_receiver_state::{ChannelReceiverState, DeliveryCause},
-        options::{BasicConsumeOptions, BasicQosOptions},
+        killswitch::KillSwitch,
+        options::{BasicAckOptions, BasicConsumeOptions, BasicQosOptions},
         secret_update::SecretUpdate,
         types::{ChannelId, FieldTable, ShortString},
     };
@@ -437,6 +438,73 @@ mod tests {
         let conn = Connection::new(configuration, status, internal_rpc.handle(), events);
         conn.status.set_state(ConnectionState::Connected);
         (conn, channels, internal_rpc.handle(), frames)
+    }
+
+    /// The IO loop behind `create_connection`'s handle is already gone, as it is for an ack that
+    /// passed the `poisoned()` check just before its connection closed: the ack's command is
+    /// never run, and its promise must still complete.
+    #[tokio::test]
+    async fn an_ack_whose_command_never_runs_completes() {
+        let (_conn, _channels, internal_rpc) = create_connection();
+        let acker = Acker::new(1, 1, Some(internal_rpc), None, KillSwitch::default());
+        let ack = acker.ack(BasicAckOptions::default());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), ack)
+            .await
+            .expect("the ack never completed");
+        assert!(matches!(
+            result.unwrap_err().kind(),
+            ErrorKind::InvalidChannel(1)
+        ));
+    }
+
+    /// Awaits a call whose command is never run, as `create_connection`'s IO loop is gone.
+    async fn completes<T>(call: impl Future<Output = Result<T>>) -> Result<T> {
+        tokio::time::timeout(std::time::Duration::from_secs(1), call)
+            .await
+            .expect("the call never completed")
+    }
+
+    fn closed(error: Error) -> bool {
+        matches!(
+            error.kind(),
+            ErrorKind::InvalidConnectionState(ConnectionState::Closed)
+        )
+    }
+
+    #[tokio::test]
+    async fn a_create_channel_whose_command_never_runs_completes() {
+        let (conn, _channels, _internal_rpc) = create_connection();
+        assert!(closed(completes(conn.create_channel()).await.unwrap_err()));
+    }
+
+    #[tokio::test]
+    async fn a_close_whose_command_never_runs_completes() {
+        let (conn, _channels, _internal_rpc) = create_connection();
+        assert!(closed(
+            completes(conn.close(200, "bye".into())).await.unwrap_err()
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_update_secret_whose_command_never_runs_completes() {
+        let (conn, _channels, _internal_rpc) = create_connection();
+        let update = conn.update_secret("secret".into(), "rotation".into());
+        assert!(closed(completes(update).await.unwrap_err()));
+    }
+
+    #[test]
+    fn a_connection_shutdown_whose_command_never_runs_rejects_the_connection() {
+        let (_conn, _channels, internal_rpc) = create_connection();
+        let (promise, resolver) = Promise::<Connection>::new("connection");
+        let error: Error = ErrorKind::MissingHeartbeatError.into();
+        internal_rpc.init_connection_shutdown(error, Some(resolver));
+        let error = promise
+            .try_wait()
+            .expect("the connection promise stayed pending");
+        assert!(matches!(
+            error.unwrap_err().kind(),
+            ErrorKind::MissingHeartbeatError
+        ));
     }
 
     #[test]

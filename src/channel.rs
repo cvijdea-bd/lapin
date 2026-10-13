@@ -176,6 +176,7 @@ impl Channel {
 
     pub(crate) fn set_closed(&self, error: Error) {
         self.set_state(ChannelState::Closed);
+        self.status.poison_ackers();
         self.error_publisher_confirms(error.clone());
         self.basic_get_delivery.reject(error.clone());
         self.cancel_consumers();
@@ -185,6 +186,7 @@ impl Channel {
     // Only called in case of a protocol failure
     pub(crate) fn set_connection_error(&self, error: Error) {
         self.set_state(ChannelState::Error);
+        self.status.poison_ackers();
         self.error_publisher_confirms(error.clone());
         self.basic_get_delivery.reject(error.clone());
         // The connection will not come back, so no consumer can resume.
